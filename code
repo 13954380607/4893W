@@ -1,0 +1,291 @@
+---
+title: "4893W"
+author: "Dongnan Liu"
+date: "2025-03-16"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r}
+# Install necessary packages (if not already installed)
+install.packages(c("tidyverse", "randomForest", "xgboost", "caret", "pROC", "SHAPforxgboost"))
+
+# Load required libraries
+library(tidyverse)     # Data manipulation
+library(caret)         # Machine learning
+library(randomForest)  # Random Forest
+library(xgboost)       # XGBoost
+library(pROC)          # AUC-ROC analysis
+library(SHAPforxgboost) # SHAP interpretation for XGBoost
+
+# Load the dataset
+df <- read.csv("C:/Users/DELL/Desktop/diabetes_prediction_dataset.csv")
+
+# 🎯 Keep only non-diabetic individuals
+df_non_diabetic <- df %>% filter(diabetes == 0)
+
+# 🛠️ Check for missing values
+colSums(is.na(df_non_diabetic))
+
+# 🛠️ Handle missing values (replace with mean)
+df_non_diabetic <- df_non_diabetic %>%
+  mutate(across(c(age, bmi, HbA1c_level, blood_glucose_level), ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+
+# 🔍 Encode categorical variables properly
+df_non_diabetic$gender <- as.factor(df_non_diabetic$gender)
+df_non_diabetic$smoking_history <- as.factor(df_non_diabetic$smoking_history)
+df_non_diabetic$heart_disease <- as.factor(df_non_diabetic$heart_disease)
+```
+```{r}
+X <- df_non_diabetic %>% select(-c(diabetes, heart_disease))
+y <- df_non_diabetic$heart_disease
+```
+
+
+```{r}
+# 🎯 Split dataset into training and test sets (80-20 split)
+set.seed(42)
+train_index <- createDataPartition(y, p = 0.8, list = FALSE)
+X_train <- X[train_index, ]
+X_test  <- X[-train_index, ]
+y_train <- y[train_index]
+y_test  <- y[-train_index]
+
+# 🎯 Compute Class Weights
+num_heart_disease <- sum(y_train == 1)
+num_no_heart_disease <- sum(y_train == 0)
+class_weight_rf <- c(num_no_heart_disease, num_heart_disease) / length(y_train)
+xgb_weight <- num_no_heart_disease / num_heart_disease  # Used in XGBoost
+
+# 🎯 Train a Random Forest model with class weighting
+rf_model <- randomForest(
+  x = X_train, 
+  y = y_train, 
+  ntree = 100, 
+  importance = TRUE, 
+  classwt = class_weight_rf  # Adjusts for class imbalance
+)
+
+# 🎯 Make predictions with Random Forest
+rf_pred <- predict(rf_model, X_test, type = "prob")[,2]  # Get probability scores
+
+# 🎯 Convert categorical variables in X_train/X_test to numeric matrix for XGBoost
+X_train_matrix <- model.matrix(~. -1, data = X_train)
+X_test_matrix <- model.matrix(~. -1, data = X_test)
+
+# Ensure y_train is numeric
+y_train_numeric <- as.numeric(y_train) - 1
+y_test_numeric <- as.numeric(y_test) - 1
+
+# 🎯 Train an XGBoost model with class weighting
+xgb_model <- xgboost(
+  data = X_train_matrix, 
+  label = y_train_numeric,
+  nrounds = 100, 
+  objective = "binary:logistic", 
+  eval_metric = "auc",
+  scale_pos_weight = xgb_weight  # Balances classes
+)
+
+# 🎯 Make predictions with XGBoost
+xgb_pred <- predict(xgb_model, X_test_matrix)
+
+# 🎯 Compute AUC-ROC
+rf_auc <- roc(y_test_numeric, rf_pred)$auc
+xgb_auc <- roc(y_test_numeric, xgb_pred)$auc
+
+print(paste("Random Forest AUC:", round(rf_auc, 4)))
+print(paste("XGBoost AUC:", round(xgb_auc, 4)))
+
+# 🎯 Plot ROC Curves
+roc_rf <- roc(y_test_numeric, rf_pred)
+roc_xgb <- roc(y_test_numeric, xgb_pred)
+
+plot(roc_rf, col = "blue", main = "ROC Curve")
+plot(roc_xgb, col = "red", add = TRUE)
+legend("bottomright", legend = c("Random Forest", "XGBoost"), col = c("blue", "red"), lty = 1)
+
+# 🎯 Compute F1-Score function
+f1_score <- function(predictions, actual) {
+  cm <- table(actual, predictions > 0.5)
+  precision <- cm[2,2] / (cm[2,2] + cm[1,2])
+  recall <- cm[2,2] / (cm[2,2] + cm[2,1])
+  f1 <- 2 * (precision * recall) / (precision + recall)
+  return(f1)
+}
+
+f1_rf <- f1_score(rf_pred, y_test_numeric)
+f1_xgb <- f1_score(xgb_pred, y_test_numeric)
+
+# 🎯 Print evaluation results
+print(paste("Random Forest AUC:", round(rf_auc, 4)))
+print(paste("XGBoost AUC:", round(xgb_auc, 4)))
+print(paste("Random Forest F1-Score:", round(f1_rf, 4)))
+print(paste("XGBoost F1-Score:", round(f1_xgb, 4)))
+# 🎯 1️⃣ Compute Precision, Recall, and Confusion Matrix
+rf_pred_class <- ifelse(rf_pred > 0.5, 1, 0)  # Convert RF probabilities to binary predictions
+xgb_pred_class <- ifelse(xgb_pred > 0.5, 1, 0)  # Convert XGB probabilities to binary predictions
+
+conf_matrix_rf <- table(Predicted = rf_pred_class, Actual = y_test_numeric)
+conf_matrix_xgb <- table(Predicted = xgb_pred_class, Actual = y_test_numeric)
+
+rf_precision <- conf_matrix_rf[2,2] / sum(conf_matrix_rf[2,])  # Precision = TP / (TP + FP)
+rf_recall <- conf_matrix_rf[2,2] / sum(conf_matrix_rf[,2])  # Recall = TP / (TP + FN)
+
+xgb_precision <- conf_matrix_xgb[2,2] / sum(conf_matrix_xgb[2,])  # Precision = TP / (TP + FP)
+xgb_recall <- conf_matrix_xgb[2,2] / sum(conf_matrix_xgb[,2])  # Recall = TP / (TP + FN)
+
+print("Confusion Matrix for Random Forest:")
+print(conf_matrix_rf)
+print(paste("Random Forest Precision:", round(rf_precision, 4)))
+print(paste("Random Forest Recall:", round(rf_recall, 4)))
+
+print("Confusion Matrix for XGBoost:")
+print(conf_matrix_xgb)
+print(paste("XGBoost Precision:", round(xgb_precision, 4)))
+print(paste("XGBoost Recall:", round(xgb_recall, 4)))
+```
+```{r}
+install.packages("PRROC")
+
+```
+```{r}
+library(PRROC)
+
+pr_rf <- pr.curve(scores.class0 = rf_pred, weights.class0 = y_test_numeric, curve = TRUE)
+pr_xgb <- pr.curve(scores.class0 = xgb_pred, weights.class0 = y_test_numeric, curve = TRUE)
+
+print(paste("Random Forest PR-AUC:", round(pr_rf$auc.integral, 4)))
+print(paste("XGBoost PR-AUC:", round(pr_xgb$auc.integral, 4)))
+
+# 🎯 3️⃣ Statistical Test for AUC Comparison Between RF & XGBoost
+roc_test <- roc.test(roc_rf, roc_xgb)  # Performs DeLong’s test for two correlated ROC curves
+print(roc_test)
+
+# 🎯 4️⃣ Adjust XGBoost Decision Threshold to Improve F1-Score
+thresholds <- seq(0.3, 0.7, by = 0.05)
+best_f1 <- 0
+best_threshold <- 0.5
+
+for (t in thresholds) {
+  pred_adjusted <- ifelse(xgb_pred > t, 1, 0)
+  f1_adj <- f1_score(pred_adjusted, y_test_numeric)
+  if (f1_adj > best_f1) {
+    best_f1 <- f1_adj
+    best_threshold <- t
+  }
+}
+
+print(paste("Best XGBoost Threshold:", best_threshold))
+print(paste("Improved XGBoost F1-Score:", round(best_f1, 4)))
+```
+```{r}
+library(ggplot2)
+library(reshape2)
+
+# Convert confusion matrix to data frame
+plot_conf_matrix <- function(conf_matrix, model_name) {
+  conf_matrix_df <- as.data.frame(as.table(conf_matrix))
+  colnames(conf_matrix_df) <- c("Predicted", "Actual", "Freq")
+  
+  ggplot(conf_matrix_df, aes(x = Actual, y = Predicted, fill = Freq)) +
+    geom_tile() +
+    geom_text(aes(label = Freq), color = "white", size = 6) +
+    scale_fill_gradient(low = "blue", high = "red") +
+    labs(title = paste("Confusion Matrix for", model_name), x = "Actual", y = "Predicted") +
+    theme_minimal()
+}
+
+# Plot for RF and XGBoost
+plot_conf_matrix(conf_matrix_rf, "Random Forest")
+plot_conf_matrix(conf_matrix_xgb, "XGBoost")
+```
+```{r}
+# 🎯 SHAP Feature Importance for XGBoost
+library(SHAPforxgboost)
+
+# Prepare SHAP values
+shap_values <- shap.prep(xgb_model = xgb_model, X_train = X_train_matrix)
+
+# Plot SHAP Summary
+shap.plot.summary(shap_values)
+```
+```{r}
+# Load necessary libraries
+library(caret)
+library(ranger)
+library(doParallel)
+
+# Define hyperparameter grid
+rf_grid <- expand.grid(
+  mtry = c(2, 4, 6),               # Number of variables randomly sampled at each split
+  splitrule = c("gini"),           # Use Gini impurity
+  min.node.size = c(1, 3, 5)       # Minimum node size
+)
+
+# Define cross-validation control
+control <- trainControl(method = "cv", number = 3, search = "grid")
+
+# Enable parallel processing
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+
+# Train Random Forest model with hyperparameter tuning
+rf_optimized <- train(
+  heart_disease ~ ., data = df_non_diabetic,
+  method = "ranger",
+  trControl = control,
+  tuneGrid = rf_grid
+)
+
+stopCluster(cl)  # Stop parallel processing
+
+# Print best hyperparameters
+print("Best Hyperparameters for Random Forest:")
+print(rf_optimized$bestTune)
+
+```
+
+
+
+```{r}
+print(rf_optimized$bestTune)
+```
+
+```{r}
+# Train Final Random Forest Model with Optimized Hyperparameters
+rf_final <- randomForest(
+  x = X_train, 
+  y = y_train, 
+  ntree = 200, 
+  mtry = 4,                   # Optimized mtry
+  nodesize = 3,               # Optimized min.node.size
+  importance = TRUE, 
+  classwt = class_weight_rf    # Class balancing
+)
+
+# Make predictions
+rf_pred <- predict(rf_final, X_test, type = "prob")[,2]
+
+# Compute AUC-ROC
+rf_auc <- roc(y_test, rf_pred)$auc
+print(paste("Final Random Forest AUC:", round(rf_auc, 4)))
+```
+
+
+```{r}
+install.packages("ggcorrplot")
+```
+
+```{r}
+# Load necessary library
+library(ggcorrplot)
+
+X_train_numeric <- X_train[, sapply(X_train, is.numeric)]
+cor_matrix <- cor(X_train_numeric)
+
+
+# Plot Correlation Heatmap
+ggcorrplot(cor_matrix, method = "circle", lab = TRUE, title = "Feature Correlation Heatmap")
+```
