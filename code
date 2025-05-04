@@ -44,8 +44,16 @@ y <- df_non_diabetic$heart_disease
 
 
 ```{r}
+# 🎯 Load necessary libraries
+library(caret)
+library(randomForest)
+library(xgboost)
+library(pROC)
+library(PRROC)
+library(zoo)
+
 # 🎯 Split dataset into training and test sets (80-20 split)
-set.seed(42)
+set.seed(4052)
 train_index <- createDataPartition(y, p = 0.8, list = FALSE)
 X_train <- X[train_index, ]
 X_test  <- X[-train_index, ]
@@ -56,96 +64,146 @@ y_test  <- y[-train_index]
 num_heart_disease <- sum(y_train == 1)
 num_no_heart_disease <- sum(y_train == 0)
 class_weight_rf <- c(num_no_heart_disease, num_heart_disease) / length(y_train)
-xgb_weight <- num_no_heart_disease / num_heart_disease  # Used in XGBoost
+xgb_weight <- num_no_heart_disease / num_heart_disease
 
-# 🎯 Train a Random Forest model with class weighting
+# 🎯 Train Random Forest
 rf_model <- randomForest(
-  x = X_train, 
-  y = y_train, 
-  ntree = 100, 
-  importance = TRUE, 
-  classwt = class_weight_rf  # Adjusts for class imbalance
+  x = X_train, y = y_train, ntree = 100, importance = TRUE,
+  classwt = class_weight_rf
 )
+rf_pred <- predict(rf_model, X_test, type = "prob")[,2]
 
-# 🎯 Make predictions with Random Forest
-rf_pred <- predict(rf_model, X_test, type = "prob")[,2]  # Get probability scores
-
-# 🎯 Convert categorical variables in X_train/X_test to numeric matrix for XGBoost
+# 🎯 Prepare data for XGBoost
 X_train_matrix <- model.matrix(~. -1, data = X_train)
 X_test_matrix <- model.matrix(~. -1, data = X_test)
-
-# Ensure y_train is numeric
 y_train_numeric <- as.numeric(y_train) - 1
 y_test_numeric <- as.numeric(y_test) - 1
 
-# 🎯 Train an XGBoost model with class weighting
 xgb_model <- xgboost(
-  data = X_train_matrix, 
-  label = y_train_numeric,
-  nrounds = 100, 
-  objective = "binary:logistic", 
-  eval_metric = "auc",
-  scale_pos_weight = xgb_weight  # Balances classes
+  data = X_train_matrix, label = y_train_numeric, nrounds = 100,
+  objective = "binary:logistic", eval_metric = "auc",
+  scale_pos_weight = xgb_weight, verbose = 0
 )
-
-# 🎯 Make predictions with XGBoost
 xgb_pred <- predict(xgb_model, X_test_matrix)
 
-# 🎯 Compute AUC-ROC
-rf_auc <- roc(y_test_numeric, rf_pred)$auc
-xgb_auc <- roc(y_test_numeric, xgb_pred)$auc
+# 🎯 Interpolated ROC Curve
+thresholds <- seq(0, 1, length.out = 1000)
+roc_rf <- roc(y_test_numeric, rf_pred, quiet = TRUE)
+roc_xgb <- roc(y_test_numeric, xgb_pred, quiet = TRUE)
 
-print(paste("Random Forest AUC:", round(rf_auc, 4)))
-print(paste("XGBoost AUC:", round(xgb_auc, 4)))
+roc_rf_interp <- coords(roc_rf, x = thresholds, input = "threshold",
+                        ret = c("specificity", "sensitivity"), transpose = FALSE)
+roc_xgb_interp <- coords(roc_xgb, x = thresholds, input = "threshold",
+                         ret = c("specificity", "sensitivity"), transpose = FALSE)
 
-# 🎯 Plot ROC Curves
-roc_rf <- roc(y_test_numeric, rf_pred)
-roc_xgb <- roc(y_test_numeric, xgb_pred)
-
-plot(roc_rf, col = "blue", main = "ROC Curve")
-plot(roc_xgb, col = "red", add = TRUE)
+plot(1 - roc_rf_interp$specificity, roc_rf_interp$sensitivity, type = "l", col = "blue", lwd = 2,
+     xlab = "1 - Specificity", ylab = "Sensitivity", main = "Interpolated ROC Curve (Fair Comparison)")
+lines(1 - roc_xgb_interp$specificity, roc_xgb_interp$sensitivity, col = "red", lwd = 2)
+abline(0, 1, lty = 2, col = "gray")
 legend("bottomright", legend = c("Random Forest", "XGBoost"), col = c("blue", "red"), lty = 1)
 
-# 🎯 Compute F1-Score function
+# 🎯 Interpolated AUC
+auc_interp <- function(specificity, sensitivity) {
+  x <- 1 - specificity
+  y <- sensitivity
+  idx <- order(x)
+  sum(diff(x[idx]) * zoo::rollmean(y[idx], 2))
+}
+rf_auc_interp <- auc_interp(roc_rf_interp$specificity, roc_rf_interp$sensitivity)
+xgb_auc_interp <- auc_interp(roc_xgb_interp$specificity, roc_xgb_interp$sensitivity)
+
+cat("Interpolated AUC - Random Forest:", round(rf_auc_interp, 4), "\n")
+cat("Interpolated AUC - XGBoost:", round(xgb_auc_interp, 4), "\n")
+
+# 🎯 F1-score with error handling
 f1_score <- function(predictions, actual) {
-  cm <- table(actual, predictions > 0.5)
-  precision <- cm[2,2] / (cm[2,2] + cm[1,2])
-  recall <- cm[2,2] / (cm[2,2] + cm[2,1])
-  f1 <- 2 * (precision * recall) / (precision + recall)
+  pred_class <- ifelse(predictions > 0.5, 1, 0)
+  cm <- table(factor(actual, levels = c(0,1)), factor(pred_class, levels = c(0,1)))
+  TP <- cm[2,2]; FP <- cm[1,2]; FN <- cm[2,1]
+  precision <- ifelse((TP + FP) == 0, 0, TP / (TP + FP))
+  recall <- ifelse((TP + FN) == 0, 0, TP / (TP + FN))
+  f1 <- ifelse((precision + recall) == 0, 0, 2 * precision * recall / (precision + recall))
   return(f1)
 }
-
 f1_rf <- f1_score(rf_pred, y_test_numeric)
 f1_xgb <- f1_score(xgb_pred, y_test_numeric)
 
-# 🎯 Print evaluation results
-print(paste("Random Forest AUC:", round(rf_auc, 4)))
-print(paste("XGBoost AUC:", round(xgb_auc, 4)))
-print(paste("Random Forest F1-Score:", round(f1_rf, 4)))
-print(paste("XGBoost F1-Score:", round(f1_xgb, 4)))
-# 🎯 1️⃣ Compute Precision, Recall, and Confusion Matrix
-rf_pred_class <- ifelse(rf_pred > 0.5, 1, 0)  # Convert RF probabilities to binary predictions
-xgb_pred_class <- ifelse(xgb_pred > 0.5, 1, 0)  # Convert XGB probabilities to binary predictions
+cat("Random Forest F1-Score:", round(f1_rf, 4), "\n")
+cat("XGBoost F1-Score:", round(f1_xgb, 4), "\n")
 
-conf_matrix_rf <- table(Predicted = rf_pred_class, Actual = y_test_numeric)
-conf_matrix_xgb <- table(Predicted = xgb_pred_class, Actual = y_test_numeric)
+# 🎯 Confusion Matrices
+rf_pred_class <- ifelse(rf_pred > 0.5, 1, 0)
+xgb_pred_class <- ifelse(xgb_pred > 0.5, 1, 0)
+conf_matrix_rf <- table(Predicted = factor(rf_pred_class, levels = c(0,1)),
+                        Actual = factor(y_test_numeric, levels = c(0,1)))
+conf_matrix_xgb <- table(Predicted = factor(xgb_pred_class, levels = c(0,1)),
+                         Actual = factor(y_test_numeric, levels = c(0,1)))
 
-rf_precision <- conf_matrix_rf[2,2] / sum(conf_matrix_rf[2,])  # Precision = TP / (TP + FP)
-rf_recall <- conf_matrix_rf[2,2] / sum(conf_matrix_rf[,2])  # Recall = TP / (TP + FN)
+get_precision_recall <- function(cm) {
+  TP <- cm[2,2]; FP <- cm[2,1]; FN <- cm[1,2]
+  precision <- ifelse((TP + FP) == 0, 0, TP / (TP + FP))
+  recall <- ifelse((TP + FN) == 0, 0, TP / (TP + FN))
+  return(c(precision = precision, recall = recall))
+}
 
-xgb_precision <- conf_matrix_xgb[2,2] / sum(conf_matrix_xgb[2,])  # Precision = TP / (TP + FP)
-xgb_recall <- conf_matrix_xgb[2,2] / sum(conf_matrix_xgb[,2])  # Recall = TP / (TP + FN)
+rf_metrics <- get_precision_recall(conf_matrix_rf)
+xgb_metrics <- get_precision_recall(conf_matrix_xgb)
 
 print("Confusion Matrix for Random Forest:")
 print(conf_matrix_rf)
-print(paste("Random Forest Precision:", round(rf_precision, 4)))
-print(paste("Random Forest Recall:", round(rf_recall, 4)))
+cat("Random Forest Precision:", round(rf_metrics["precision"], 4), "\n")
+cat("Random Forest Recall:", round(rf_metrics["recall"], 4), "\n")
 
 print("Confusion Matrix for XGBoost:")
 print(conf_matrix_xgb)
-print(paste("XGBoost Precision:", round(xgb_precision, 4)))
-print(paste("XGBoost Recall:", round(xgb_recall, 4)))
+cat("XGBoost Precision:", round(xgb_metrics["precision"], 4), "\n")
+cat("XGBoost Recall:", round(xgb_metrics["recall"], 4), "\n")
+
+# 🎯 PR-AUC
+pr_rf <- pr.curve(scores.class0 = rf_pred[y_test_numeric == 1],
+                  scores.class1 = rf_pred[y_test_numeric == 0], curve = TRUE)
+pr_xgb <- pr.curve(scores.class0 = xgb_pred[y_test_numeric == 1],
+                   scores.class1 = xgb_pred[y_test_numeric == 0], curve = TRUE)
+
+cat("PR AUC - Random Forest:", round(pr_rf$auc.integral, 4), "\n")
+cat("PR AUC - XGBoost:", round(pr_xgb$auc.integral, 4), "\n")
+
+# 🎯 PR Curve Plot
+plot(pr_rf$curve[,1], pr_rf$curve[,2], type = "l", col = "blue", lwd = 2,
+     xlab = "Recall", ylab = "Precision", main = "Precision-Recall Curve")
+lines(pr_xgb$curve[,1], pr_xgb$curve[,2], col = "red", lwd = 2)
+legend("bottomleft", legend = c("Random Forest", "XGBoost"), col = c("blue", "red"), lty = 1)
 ```
+
+```{r}
+# 🔁 Fix the horizontal axis: 1 - specificity, as a common evaluation basis
+x_fixed <- seq(0, 1, length.out = 1000)
+
+# 🔁 Apply spline interpolation for sensitivity values of both models onto the same x-axis
+y_rf_interp <- approx(1 - roc_rf_interp$specificity, roc_rf_interp$sensitivity, xout = x_fixed)$y
+y_xgb_interp <- approx(1 - roc_xgb_interp$specificity, roc_xgb_interp$sensitivity, xout = x_fixed)$y
+
+# 🔁 Now y_rf_interp and y_xgb_interp share the same x-axis
+plot(x_fixed, y_rf_interp, type = "l", col = "blue", lwd = 2,
+     xlab = "1 - Specificity", ylab = "Sensitivity", main = "Fair ROC Comparison (Spline Interpolated)")
+lines(x_fixed, y_xgb_interp, col = "red", lwd = 2)
+legend("bottomright", legend = c("Random Forest", "XGBoost"), col = c("blue", "red"), lty = 1)
+
+# 📊 Check sensitivity difference after spline interpolation
+abs_diff <- abs(y_rf_interp - y_xgb_interp)
+mean_abs_diff <- mean(abs_diff)
+rel_diff <- mean(abs_diff / ((y_rf_interp + y_xgb_interp) / 2))
+
+cat("Mean absolute difference in sensitivity:", round(mean_abs_diff, 4), "\n")
+cat("Mean relative difference in sensitivity:", round(rel_diff, 4), "\n")
+
+# 📈 Plot the sensitivity difference curve (XGB - RF)
+plot(x_fixed, y_xgb_interp - y_rf_interp, type = "l", col = "purple", lwd = 2,
+     xlab = "1 - Specificity", ylab = "Sensitivity Difference (XGB - RF)",
+     main = "Sensitivity Difference Across 1 - Specificity")
+abline(h = 0, lty = 2, col = "gray")
+```
+
 ```{r}
 install.packages("PRROC")
 
