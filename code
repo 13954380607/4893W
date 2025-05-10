@@ -315,32 +315,6 @@ print(rf_optimized$bestTune)
 ```
 
 
-
-```{r}
-print(rf_optimized$bestTune)
-```
-
-```{r}
-# Train Final Random Forest Model with Optimized Hyperparameters
-rf_final <- randomForest(
-  x = X_train, 
-  y = y_train, 
-  ntree = 200, 
-  mtry = 4,                   # Optimized mtry
-  nodesize = 3,               # Optimized min.node.size
-  importance = TRUE, 
-  classwt = class_weight_rf    # Class balancing
-)
-
-# Make predictions
-rf_pred <- predict(rf_final, X_test, type = "prob")[,2]
-
-# Compute AUC-ROC
-rf_auc <- roc(y_test, rf_pred)$auc
-print(paste("Final Random Forest AUC:", round(rf_auc, 4)))
-```
-
-
 ```{r}
 install.packages("ggcorrplot")
 ```
