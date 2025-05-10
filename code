@@ -68,7 +68,7 @@ xgb_weight <- num_no_heart_disease / num_heart_disease
 
 # 🎯 Train Random Forest
 rf_model <- randomForest(
-  x = X_train, y = y_train, ntree = 100, importance = TRUE,
+  x = X_train, y = y_train, ntree = 1000, importance = TRUE,
   classwt = class_weight_rf
 )
 rf_pred <- predict(rf_model, X_test, type = "prob")[,2]
